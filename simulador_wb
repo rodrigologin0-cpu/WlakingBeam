@@ -1,0 +1,202 @@
+"""Walking Beam: estudo geométrico offline. Execute: py simulador_wb.py
+Somente matplotlib é externo. Coordenadas em mm; x=0 na parede da entrada.
+"""
+import json
+import math
+import textwrap
+from pathlib import Path
+from copy import deepcopy
+from matplotlib.figure import Figure
+from matplotlib.patches import Rectangle
+
+HERE = Path(__file__).resolve().parent
+BASE = json.loads((HERE / 'familias_base.json').read_text(encoding='utf-8'))
+WIDTH = 12170
+FIXED = {1:[940,3160,5500,6670,9010,11230],2:[1465,3685,6085,8485,10705],3:[940,3160,5500,6670,9010,11230]}
+MOVING = {1:[1990,4330,7840,10180],2:[2515,4855,7315,9655],3:[1990,4330,7840,10180]}
+ARMS = [2515,4855,7315,9655]
+BLUE, ORANGE, PURPLE = '#15608a', '#c6670a', '#823f99'
+
+def alignment(f, length, family):
+    """Reconstituição da planilha: interpolação + tolerância triangular.
+    Família 1: somente tolerância fixa. Não replica clamps/modos do PLC.
+    """
+    if not f['lo'] <= length <= f['hi'] or not f['lo'] < f['mid'] < f['hi']:
+        raise ValueError('Comprimento fora da família ou comprimento central inválido.')
+    if f['p'] < f['q'] or f['tol'] < 0:
+        raise ValueError('Requer referência em L mínimo >= referência em L máximo e tolerância >= 0.')
+    ref = f['q'] + (f['p']-f['q'])*(f['hi']-length)/(f['hi']-f['lo'])
+    triangular = 0 if family == '1' else (f['p']-f['q'])/2 * (
+        (length-f['lo'])/(f['mid']-f['lo']) if length <= f['mid'] else (f['hi']-length)/(f['hi']-f['mid']))
+    return ref, ref-triangular-f['tol'], ref+triangular+f['tol']
+
+def support(a, length, axes, pad):
+    """Contato efetivo com pads; estabilidade geométrica transversal apenas."""
+    contacts = [(v,max(a,v-pad/2),min(a+length,v+pad/2)) for v in axes
+                if min(a+length,v+pad/2)-max(a,v-pad/2) > 1e-8]
+    if not contacts:
+        return {'n':0, 'full':0, 'margin':None, 'oh':None}
+    left, right = min(r[1] for r in contacts), max(r[2] for r in contacts)
+    cg = a+length/2
+    return {'n':len(contacts), 'full':sum(a<=v-pad/2 and a+length>=v+pad/2 for v,_,_ in contacts),
+            'margin':min(cg-left,right-cg), 'oh':(left-a,a+length-right)}
+
+def model(family, f, length, mode='REF', manual=1125, drift=0, pad=100, baseline=486, mirror=True):
+    if not all(math.isfinite(v) for v in [*f.values(),length,manual,drift,pad,baseline]):
+        raise ValueError('Todos os valores devem ser finitos.')
+    if pad <= 0: raise ValueError('Pad deve ser positivo.')
+    ref, low, high = alignment(f,length,family)
+    a = {'REF':ref,'MIN':low,'MAX':high,'MANUAL':manual}[mode] - drift
+    return dict(family=family,f=f,length=length,ref=ref,low=low,high=high,a=a,
+                drift=drift,pad=pad,baseline=baseline,mirror=mirror,mode=mode)
+
+def draw(fig, d):
+    fig.clear()
+    # Largura física 12170/50 = 243,4 mm, dentro do papel A3 de 420 mm.
+    ax=fig.add_axes([.085,.19,243.4/420,.65])
+    ax.set_xlim(0,WIDTH); ax.set_ylim(0,300); ax.set_yticks([])
+    ax.set_xticks(list(range(0,11001,1000))+[12170]); ax.tick_params(axis='x',labelsize=7)
+    ax.set_xlabel('Coordenada global x (mm) - parede de entrada = 0',fontsize=8)
+    ax.grid(axis='x',alpha=.15); ax.spines[['top','right','left']].set_visible(False)
+    a,L,base,pad=d['a'],d['length'],d['baseline'],d['pad']
+    fig.text(.045,.95,f"WALKING BEAM | FAMÍLIA {d['family']}",fontsize=18,weight='bold')
+    fig.text(.045,.917,f"L = {L:.1f} mm | REF = {d['ref']:.1f} | MIN = {d['low']:.1f} | MAX = {d['high']:.1f} mm",fontsize=10)
+    fig.text(.045,.89,f"Comparado: {d['mode']} | A efetivo = {a:.1f} mm | deslocamento para parede = {d['drift']:.1f} mm",fontsize=10,color=ORANGE)
+    fig.text(.72,.95,'A3 | transversal 1:50\nPDF impresso em 100%',fontsize=10)
+    metrics=['CONTATOS DA PLACA ESQUERDA','N = pads em contato / completos','OH = ponta até borda do contato','mCG = menor margem ao limite de contato','']
+    warnings=[]
+    for sec,y in [(3,238),(2,143),(1,48)]:
+        wall=35 if sec==3 else 0
+        ax.text(-230,y+30,f'S{sec}',fontsize=11,ha='right',weight='bold',clip_on=False)
+        ax.vlines([wall,WIDTH-wall],y-15,y+42,color='#697881',lw=3)
+        for axes,style,label in [(FIXED[sec],'-','F'),(MOVING[sec],'--','M')]:
+            for j,v in enumerate(axes):
+                ax.plot([v,v],[y-12,y+35],style,color='#222',lw=.9)
+                ax.text(v,y+37 if label=='F' else y+28,f'{label}{j+1}',fontsize=6,ha='center')
+                ax.add_patch(Rectangle((v-pad/2,y),pad,13,fill=False,edgecolor='#888',lw=.5))
+        if sec in (1,3):
+            for j,v in enumerate(ARMS):
+                ax.plot([v,v],[y-15,y+35], '-.',color=PURPLE,lw=1.3)
+                ax.text(v,y+20,f'B{j+1}',fontsize=6,color=PURPLE,ha='center')
+        for offset,color,hatch,ls in [(base,BLUE,'///','-'),(a,ORANGE,'\\\\',':')]:
+            positions=[offset]+([WIDTH-offset-L] if d['mirror'] else [])
+            for pos in positions:
+                ax.add_patch(Rectangle((pos,y),L,13,fill=False,edgecolor=color,hatch=hatch,ls=ls,lw=1.1))
+                ax.plot(pos+L/2,y+6.5,'o',ms=4,mfc='white',mec=color)
+        chain=[wall]+sorted(FIXED[sec]+MOVING[sec])+[WIDTH-wall]
+        for u,v in zip(chain,chain[1:]):
+            ax.annotate('',(u,y+48),(v,y+48),arrowprops=dict(arrowstyle='|-|',lw=.4))
+            ax.text((u+v)/2,y+50,f'{v-u:g}',fontsize=6,ha='center')
+        ax.annotate('',(a,y-22),(a+L,y-22),arrowprops=dict(arrowstyle='<->',color=ORANGE,lw=.6))
+        ax.text(a+L/2,y-30,f'A local = {a-wall:.1f} | L = {L:g} | CG global = {a+L/2:.1f}',ha='center',fontsize=7,color=ORANGE)
+        metrics.append(f'SEÇÃO {sec} - COMPARADO')
+        for name,axes in [('Fixas',FIXED[sec]),('Móveis',MOVING[sec])]:
+            s=support(a,L,axes,pad)
+            if not s['n']: text=f'{name}: sem contato'; warnings.append(f'S{sec} {name}: sem contato')
+            else:
+                text=f"{name}: N {s['n']}/{s['full']} | OH {s['oh'][0]:.0f}/{s['oh'][1]:.0f}\n   mCG = {s['margin']:.1f} mm"
+                if s['margin']<=0: warnings.append(f'S{sec} {name}: CG fora/no limite')
+                if s['n']<2: warnings.append(f'S{sec} {name}: menos de 2 apoios')
+            metrics.append(text)
+        if sec in (1,3):
+            hit=[v for v in ARMS if a<=v<=a+L]
+            metrics.append('Braços cobertos (eixos): '+','.join(f'B{ARMS.index(v)+1}' for v in hit))
+            if len(hit)==2:
+                m=a+L/2-hit[0]; span=hit[1]-hit[0]
+                if 0<=m<=span:
+                    metrics.append(f'Reações ideais: {100*(1-m/span):.1f}% / {100*m/span:.1f}%')
+                else: warnings.append('Braços: CG fora do vão entre eixos')
+            elif len(hit)<2: warnings.append('Braços: menos de 2 eixos cobertos')
+        metrics.append('')
+    gap=WIDTH-2*(a+L)
+    if d['mirror']:
+        metrics.append(f'Gap frio espelhado = {gap:.1f} mm')
+        if gap<=0: warnings.append('Placas espelhadas se sobrepõem/tocam')
+    if a<400: warnings.append('Alinhamento de entrada < 400 mm')
+    if a<35 or a+L>WIDTH-35: warnings.append('Placa ultrapassa parede da saída')
+    fig.text(.70,.835,'\n'.join(metrics),fontsize=8,va='top',linespacing=1.4)
+    fig.text(.045,.115,'Azul: comparação-base | Laranja pontilhado: cenário | Preto contínuo: fixa | Preto tracejado: móvel | Roxo traço-ponto: braço',fontsize=8)
+    status='; '.join(dict.fromkeys(warnings)) 
+    """Sem alerta geométrico nos critérios exibidos; não constitui validação de segurança."""
+    fig.text(.045,.091,textwrap.fill(status,150),fontsize=8,color='#ad2929',va='top')
+    fig.text(.045,.027,'Pads 100 mm nominais (editáveis). Braços: apenas eixos; largura de contato não informada. CG = centro de placa uniforme.\nLongitudinal esquemático. Sem efeitos térmicos/dinâmicos. Parede de saída recuada 35 mm por lado (premissa).\nCurvas reconstruídas da planilha; confirmar clamps e modos PLC. Dupla espelhada opcional é hipótese, não lógica de carregamento.',fontsize=7)
+    return status
+
+class App:
+    def __init__(self):
+        import tkinter as tk
+        from tkinter import ttk
+        from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+        self.tk=tk; self.ttk=ttk
+        self.root=tk.Tk(); self.root.title('Walking Beam | Alinhamento das 13 famílias'); self.root.geometry('1450x920')
+        self.families=deepcopy(BASE);self.families['13'].update(p=720,q=490)
+        self.family=tk.StringVar(value='13');self.mode=tk.StringVar(value='REF');self.mirror=tk.BooleanVar(value=True)
+        panel=ttk.Frame(self.root,padding=12);panel.pack(side='left',fill='y')
+        ttk.Label(panel,text='ALINHAMENTO WB',font=('Segoe UI',14,'bold')).pack(anchor='w',pady=6)
+        ttk.Label(panel,text='Família').pack(anchor='w')
+        box=ttk.Combobox(panel,textvariable=self.family,values=list(BASE),state='readonly',width=20);box.pack();box.bind('<<ComboboxSelected>>',self.change_family)
+        self.vars={}
+        fields=[('lo','Comprimento mínimo'),('hi','Comprimento máximo'),('mid','Comprimento central PLC'),('p','Alinhamento em L mínimo'),('q','Alinhamento em L máximo'),('tol','Tolerância fixa ±'),('length','Comprimento da placa'),('manual','A manual / proposta'),('drift','Deslocamento para parede (+)'),('pad','Largura do pad'),('baseline','A da comparação-base')]
+        for key,label in fields:
+            ttk.Label(panel,text=label+' (mm)').pack(anchor='w',pady=(5,0))
+            var=tk.StringVar();self.vars[key]=var
+            e=ttk.Entry(panel,textvariable=var,width=24);e.pack();e.bind('<Return>',lambda _:self.update())
+        ttk.Label(panel,text='Posição do cenário').pack(anchor='w',pady=(8,0))
+        cb=ttk.Combobox(panel,textvariable=self.mode,values=['REF','MIN','MAX','MANUAL'],state='readonly',width=21);cb.pack();cb.bind('<<ComboboxSelected>>',lambda _:self.update())
+        ttk.Checkbutton(panel,text='Segunda placa espelhada',variable=self.mirror,command=self.update).pack(anchor='w',pady=7)
+        for label,cmd in [('Atualizar desenho',self.update),('Salvar parâmetros JSON',self.save),('Abrir parâmetros JSON',self.load),('Exportar PDF / SVG / PNG',self.export)]:
+            ttk.Button(panel,text=label,command=cmd).pack(fill='x',pady=3)
+        self.message=tk.StringVar();ttk.Label(panel,textvariable=self.message,wraplength=230,foreground='#ad2929').pack(pady=8)
+        self.fig=Figure(figsize=(420/25.4,297/25.4),dpi=85)
+        self.canvas=FigureCanvasTkAgg(self.fig,master=self.root);self.canvas.get_tk_widget().pack(side='right',fill='both',expand=True)
+        self.populate(); self.update()
+    def populate(self):
+        f=self.families[self.family.get()]
+        for k in f:self.vars[k].set(str(f[k]))
+        length=4560 if self.family.get()=='13' else f['mid']
+        for k,v in dict(length=length,manual=1125,drift=0,pad=100,baseline=486 if self.family.get()=='13' else alignment(BASE[self.family.get()],length,self.family.get())[0]).items():self.vars[k].set(str(v))
+    def change_family(self,event=None):
+        self.mirror.set(self.family.get()=='13');self.populate();self.update()
+    def collect(self):
+        vals={k:float(v.get().replace(',','.')) for k,v in self.vars.items()}
+        f={k:vals[k] for k in ('lo','hi','mid','p','q','tol')}
+        result=model(self.family.get(),f,vals['length'],self.mode.get(),vals['manual'],vals['drift'],vals['pad'],vals['baseline'],self.mirror.get())
+        self.families[self.family.get()]=f
+        return result
+    def update(self):
+        try:
+            self.data=self.collect();self.message.set(draw(self.fig,self.data));self.canvas.draw_idle()
+        except (ValueError,KeyError) as e:self.message.set(str(e))
+    def save(self):
+        from tkinter import filedialog,messagebox
+        try:self.collect()
+        except ValueError as e:messagebox.showerror('Parâmetros',str(e));return
+        p=filedialog.asksaveasfilename(defaultextension='.json',filetypes=[('JSON','*.json')])
+        if p:
+            payload=dict(families=self.families,family=self.family.get(),fields={k:v.get() for k,v in self.vars.items()},mode=self.mode.get(),mirror=self.mirror.get())
+            Path(p).write_text(json.dumps(payload,ensure_ascii=False,indent=2),encoding='utf-8')
+    def load(self):
+        from tkinter import filedialog,messagebox
+        p=filedialog.askopenfilename(filetypes=[('JSON','*.json')])
+        if not p:return
+        try:
+            data=json.loads(Path(p).read_text(encoding='utf-8'))
+            family=data['family']; fields=data['fields'];families=data['families']
+            if set(families)!=set(BASE):raise ValueError('Arquivo deve conter as 13 famílias.')
+            vals={k:float(str(v).replace(',','.')) for k,v in fields.items()}
+            model(family,{k:vals[k] for k in ('lo','hi','mid','p','q','tol')},vals['length'],data['mode'],vals['manual'],vals['drift'],vals['pad'],vals['baseline'],data['mirror'])
+            self.families=families;self.family.set(family);self.mode.set(data['mode']);self.mirror.set(data['mirror'])
+            for k in self.vars:self.vars[k].set(fields[k])
+            self.update()
+        except (ValueError,KeyError,TypeError) as e:messagebox.showerror('Arquivo inválido',str(e))
+    def export(self):
+        from tkinter import filedialog,messagebox
+        try:data=self.collect()
+        except ValueError as e:messagebox.showerror('Parâmetros',str(e));return
+        p=filedialog.asksaveasfilename(defaultextension='.pdf',filetypes=[('PDF A3','*.pdf'),('SVG vetorial','*.svg'),('PNG','*.png')])
+        if p:
+            # Figura independente: redimensionar janela não altera escala de exportação.
+            fig=Figure(figsize=(420/25.4,297/25.4));draw(fig,data);fig.savefig(p,dpi=180)
+    def run(self):self.root.mainloop()
+
+if __name__=='__main__':App().run()
